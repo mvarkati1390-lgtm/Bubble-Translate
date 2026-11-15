@@ -16,18 +16,24 @@ jobs:
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.9'
       - name: Restore Kotlin source
         run: |
-          gzip -dc app/src/main/java/com/example/bubbletranslate/MainActivity.kt.gz.b64 > app/src/main/java/com/example/bubbletranslate/MainActivity.kt
+          base64 -d app/src/main/java/com/example/bubbletranslate/MainActivity.kt.xz.b64 | xz -d -c > app/src/main/java/com/example/bubbletranslate/MainActivity.kt
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BubbleTranslate-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
       - name: Publish latest APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: Latest Android APK
-          body: Automatically built debug APK. Install on Android 9 or newer.
+          body: Simultaneous live translation and screen recording, with separate phone and microphone audio controls.
           files: app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true
           make_latest: true
