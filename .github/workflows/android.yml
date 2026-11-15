@@ -21,6 +21,109 @@ jobs:
         run: |
           base64 -d app/src/main/java/com/example/bubbletranslate/MainActivity.kt.xz.b64 | xz -d -c > app/src/main/java/com/example/bubbletranslate/MainActivity.kt
           sed -i 's/if (captureMic && checkSelfPermission/if ((captureMic || captureInternal) \&\& checkSelfPermission/' app/src/main/java/com/example/bubbletranslate/MainActivity.kt
+      - name: Stabilize OCR translations
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/src/main/java/com/example/bubbletranslate/MainActivity.kt")
+          s = p.read_text()
+          old = """    private val cache = ConcurrentHashMap<String, String>()
+    private val listener = ImageReader.OnImageAvailableListener { r -> onFrame(r) }
+          """
+          new = """    private val cache = ConcurrentHashMap<String, String>()
+    // Keep the first translation stable at each screen region; ignore transient OCR noise.
+    private data class StableLine(
+        var source: String,
+        var translated: String,
+        var candidate: String = "",
+        var candidateHits: Int = 0
+    )
+    private val stableLines = HashMap<String, StableLine>()
+    private val stableLock = Any()
+    private val listener = ImageReader.OnImageAvailableListener { r -> onFrame(r) }
+          """
+          assert old in s, "Could not find cache insertion point"
+          s = s.replace(old, new, 1)
+          old = """    private suspend fun cycle() {
+          """
+          helpers = """    private fun stableRegion(r: Rect): String {
+        val cellW = maxOf(48, W / 18)
+        val cellH = maxOf(32, H / 28)
+        return "${(r.centerX() / cellW)}:${(r.centerY() / cellH)}"
+    }
+
+    private fun cleanOcr(t: String): String = t.lowercase().filter { it.isLetterOrDigit() }
+
+    private fun textSimilarity(a: String, b: String): Float {
+        if (a == b) return 1f
+        if (a.isEmpty() || b.isEmpty()) return 0f
+        var previous = IntArray(b.length + 1) { it }
+        var current = IntArray(b.length + 1)
+        for (i in 1..a.length) {
+            current[0] = i
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                current[j] = minOf(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + cost)
+            }
+            val temp = previous
+            previous = current
+            current = temp
+        }
+        return 1f - previous[b.length].toFloat() / maxOf(a.length, b.length)
+    }
+
+    // A changed phrase must be recognized twice in the same screen region before replacing the translation.
+    private suspend fun translateStable(r: Rect, t: String): String {
+        val key = stableRegion(r)
+        val normalized = cleanOcr(t)
+        var oldTranslation: String? = null
+        var needsTranslation = false
+        synchronized(stableLock) {
+            val old = stableLines[key]
+            if (old == null) {
+                needsTranslation = true
+            } else if (textSimilarity(normalized, cleanOcr(old.source)) >= 0.72f) {
+                oldTranslation = old.translated
+                old.candidate = ""
+                old.candidateHits = 0
+            } else {
+                if (old.candidate.isNotEmpty() &&
+                    textSimilarity(normalized, cleanOcr(old.candidate)) >= 0.72f) {
+                    old.candidate = t
+                    old.candidateHits++
+                } else {
+                    old.candidate = t
+                    old.candidateHits = 1
+                }
+                if (old.candidateHits >= 2) needsTranslation = true
+                else oldTranslation = old.translated
+            }
+        }
+        if (!needsTranslation) return oldTranslation ?: t
+        val translated = translateLine(t)
+        synchronized(stableLock) {
+            val old = stableLines[key]
+            if (old == null) stableLines[key] = StableLine(t, translated)
+            else {
+                old.source = t
+                old.translated = translated
+                old.candidate = ""
+                old.candidateHits = 0
+            }
+        }
+        return translated
+    }
+
+          """
+          assert old in s, "Could not find cycle insertion point"
+          s = s.replace(old, helpers + old, 1)
+          old = ".map { (r, t) -> async { Triple(r, t, translateLine(t)) } }.awaitAll()"
+          new = ".map { (r, t) -> async { Triple(r, t, translateStable(r, t)) } }.awaitAll()"
+          assert old in s, "Could not find OCR translation call"
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+          grep -q "translateStable(r, t)" app/src/main/java/com/example/bubbletranslate/MainActivity.kt
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
       - name: Upload APK artifact
@@ -34,7 +137,7 @@ jobs:
         with:
           tag_name: latest
           name: Latest Android APK
-          body: Simultaneous live translation and screen recording, with separate phone and microphone audio controls.
+          body: OCR translation stability fix: one stable translation per detected text region.
           files: app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true
           make_latest: true
