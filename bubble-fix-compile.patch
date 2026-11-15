@@ -1,0 +1,20 @@
+--- app/src/main/java/com/example/bubbletranslate/MainActivity.kt
++++ app/src/main/java/com/example/bubbletranslate/MainActivity.kt
+@@ -882,7 +882,7 @@
+             var frame: Bitmap? = null
+             var waited = 0
+-            while (isActive && live && frame == null && waited < 1200) {
++            while (currentCoroutineContext().isActive && live && frame == null && waited < 1200) {
+                 delay(40)
+                 frame = snapshot(true)
+                 waited += 40
+             }
+-            if (!isActive || !live || frame == null) return
++            if (!currentCoroutineContext().isActive || !live || frame == null) return
+@@ -895,7 +895,7 @@
+                 val result = recognizer.process(InputImage.fromBitmap(crop, 0)).await()
+-                if (!isActive || !live) return
++                if (!currentCoroutineContext().isActive || !live) return
+@@ -908,7 +908,7 @@
+-                if (live && isActive) {
++                if (live && currentCoroutineContext().isActive) {
