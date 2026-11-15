@@ -1,0 +1,223 @@
+--- app/src/main/java/com/example/bubbletranslate/MainActivity.kt
++++ app/src/main/java/com/example/bubbletranslate/MainActivity.kt
+@@ -617,6 +617,9 @@
+     private lateinit var overlay: OverlayView
+     private lateinit var bubble: Bubble
+     private var menu: View? = null
++    private var bubbleParams: WindowManager.LayoutParams? = null
++    private var bubbleSize = 0
++    private var scanJob: Job? = null
+     private var translator: Translator? = null
+     private lateinit var recognizer: TextRecognizer
+     private var W = 0
+@@ -651,15 +654,11 @@
+         mode = cfg.getInt("mode", 10)
+         all = cfg.getBoolean("all", true)
+         dstFa = dst == TranslateLanguage.PERSIAN
+-        useFgl = srcRaw == Langs.AUTO || srcRaw == Langs.FGL
++        // این نسخه فقط فینگلیش را به فارسی تبدیل می‌کند؛ متن انگلیسی دست‌نخورده می‌ماند.
++        useFgl = true
+         val eng = Langs.engOf(srcRaw)
+         recognizer = Langs.recognizer(eng)
+-        if (srcRaw != Langs.FGL) {
+-            translator = Translation.getClient(TranslatorOptions.Builder().setSourceLanguage(eng).setTargetLanguage(dst).build())
+-            translator!!.downloadModelIfNeeded().addOnFailureListener {
+-                Toast.makeText(this, "مدل ترجمه دانلود نشده؛ یک بار با اینترنت دانلود کن", Toast.LENGTH_LONG).show()
+-            }
+-        }
++        // ترجمهٔ ماشینی عمومی خاموش است تا انگلیسی معمولی اشتباهی ترجمه نشود.
+ 
+         wm = getSystemService(WINDOW_SERVICE) as WindowManager
+         screen().let { W = it.first; H = it.second }
+@@ -675,11 +674,10 @@
+         overlay = OverlayView(this)
+         wm.addView(overlay, lp(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, false))
+         addBubble()
+-        live = true
+-        force = true
+-        bubble.on = true
++        live = false
++        force = false
++        bubble.on = false
+         bubble.invalidate()
+-        startLoop()
+         // After the one MediaProjection consent, start translation and recording together.
+         main.post { startRecordingAutomatically() }
+         return START_NOT_STICKY
+@@ -769,6 +767,8 @@
+         bubble = Bubble(this)
+         val s = (56 * resources.displayMetrics.density).toInt()
+         val bp = lp(s, s, true).apply { x = 16; y = H / 3 }
++        bubbleParams = bp
++        bubbleSize = s
+         bubble.setOnTouchListener(object : View.OnTouchListener {
+             var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false; var t0 = 0L
+             override fun onTouch(v: View, e: MotionEvent): Boolean {
+@@ -853,83 +853,83 @@
+ 
+     private fun toggle() {
+         live = !live
+-        bubble.on = live; bubble.invalidate()
+-        if (live) force = true else { shown = emptyList(); overlay.show(emptyList()) }
+-    }
+-
+-    private fun startLoop() = scope.launch {
+-        while (isActive) {
+-            delay(if (mode == 12) 500 else 700)
+-            val s = screen()
+-            if (s.first != W || s.second != H) withContext(Dispatchers.Main) { resize(s.first, s.second) }
+-            if (!live) { snapshot(true); continue }
+-            try { cycle() } catch (e: CancellationException) { throw e } catch (e: Exception) { /* ترجمه‌ی قبلی سر جایش می‌ماند */ }
+-        }
+-    }
+-
+-    // هر خط: فینگلیش → تبدیل به فارسی (آفلاین)؛ غیر از آن → ترجمه ML Kit
+-    private suspend fun translateLine(t: String): String {
+-        cache[t]?.let { return it }
+-        var out = if (useFgl && Finglish.isFinglish(t)) Finglish.toPersian(t, all)
+-        else (translator?.translate(t)?.await() ?: t)
+-        // «همه‌چیز»: اسم‌ها و حروف لاتین باقی‌مانده هم به فارسی نوشته می‌شوند
+-        if (all && dstFa) out = Finglish.toPersian(out, true)
+-        cache[t] = out
+-        return out
+-    }
+-
+-    private suspend fun cycle() {
+-        var frame = snapshot(true) ?: (if (force) last else null) ?: return
+-        force = false
+-
+-        // اگر ترجمه روی صفحه است: فقط ~۸۰ میلی‌ثانیه مخفی می‌شود تا فریم تمیز بگیریم و فوراً برمی‌گردد
+-        if (shown.isNotEmpty()) {
+-            val seq = frameSeq
+-            withContext(Dispatchers.Main) { overlay.show(emptyList()) }
+-            delay(70)
+-            var w = 70
+-            while (frameSeq == seq && w < 350) { delay(15); w += 15 }
+-            val fresh = if (frameSeq != seq) snapshot(false) else null
+-            withContext(Dispatchers.Main) { overlay.show(shown) }
+-            frame = fresh ?: return      // فریم تمیز نیامد؟ ترجمه‌ی قبلی را نگه دار، دوباره تلاش کن
+-        }
+-        if (frame.width != W || frame.height != H) return
+-
+-        val top = if (mode == 12) (H * 0.6f).toInt() else 0
+-        val crop = Bitmap.createBitmap(frame, 0, top, W, H - top)
+-        val res = recognizer.process(InputImage.fromBitmap(crop, 0)).await()
+-
+-        val raw: List<Pair<Rect, String>> = when (mode) {
+-            12 -> {
+-                val bs = res.textBlocks.filter { it.boundingBox != null }
+-                if (bs.isEmpty()) emptyList() else {
+-                    val u = Rect(bs[0].boundingBox!!)
+-                    bs.forEach { u.union(it.boundingBox!!) }
+-                    listOf(u to bs.joinToString(" ") { it.text.replace("\n", " ") })
++        bubble.on = live
++        bubble.invalidate()
++        if (!live) {
++            scanJob?.cancel()
++            scanJob = null
++            shown = emptyList()
++            overlay.show(emptyList())
++        } else {
++            shown = emptyList()
++            overlay.show(emptyList())
++            scanJob?.cancel()
++            scanJob = scope.launch { translateAtBubbleOnce() }
++        }
++    }
++
++    // فقط محدودهٔ اطراف محل حباب یک بار OCR می‌شود؛ هیچ اسکن پیوسته‌ای وجود ندارد.
++    private suspend fun translateAtBubbleOnce() {
++        val bp = bubbleParams ?: return
++        val d = resources.displayMetrics.density
++        val centerX = bp.x + bubbleSize / 2
++        val centerY = bp.y + bubbleSize / 2
++        val regionW = minOf(W, (560 * d).toInt()).coerceAtLeast(1)
++        val regionH = minOf(H, (260 * d).toInt()).coerceAtLeast(1)
++        val left = (centerX - regionW / 2).coerceIn(0, (W - regionW).coerceAtLeast(0))
++        val top = (centerY - regionH / 2).coerceIn(0, (H - regionH).coerceAtLeast(0))
++
++        // حباب و ترجمهٔ قبلی موقتاً پنهان می‌شوند تا OCR تصویر تمیز بگیرد.
++        withContext(Dispatchers.Main) {
++            overlay.show(emptyList())
++            bubble.visibility = View.INVISIBLE
++        }
++        try {
++            var frame: Bitmap? = null
++            var waited = 0
++            while (isActive && live && frame == null && waited < 1200) {
++                delay(40)
++                frame = snapshot(true)
++                waited += 40
++            }
++            if (!isActive || !live || frame == null) return
++            val full = frame
++            if (full.width != W || full.height != H) return
++            val crop = Bitmap.createBitmap(full, left, top, regionW, regionH)
++            try {
++                val result = recognizer.process(InputImage.fromBitmap(crop, 0)).await()
++                if (!isActive || !live) return
++                val lines = result.textBlocks.flatMap { it.lines }
++                    .mapNotNull { line -> line.boundingBox?.let { it to line.text } }
++                    .filter { (_, text) -> text.count(Char::isLetter) >= 2 && Finglish.isFinglish(text) }
++                val items = lines.mapNotNull { (r, rawText) ->
++                    val translated = Finglish.toPersian(rawText, all)
++                    if (translated == rawText) null else {
++                        val box = RectF(r).apply { offset(left.toFloat(), top.toFloat()); inset(-5f, -3f) }
++                        val bg = sampleBg(full, box)
++                        val fg = if (Color.luminance(bg) > 0.5f) Color.BLACK else Color.WHITE
++                        Item(box, Color.argb(235, Color.red(bg), Color.green(bg), Color.blue(bg)), fit(translated, box, fg, true))
++                    }
+                 }
+-            }
+-            11 -> res.textBlocks.mapNotNull { b -> b.boundingBox?.let { it to b.text.replace("\n", " ") } }
+-            else -> res.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { it to l.text } }
+-        }
+-
+-        val minLetters = if (all) 1 else 2
+-        val out = coroutineScope {
+-            raw.filter { it.second.count(Char::isLetter) >= minLetters }
+-                .map { (r, t) -> async { Triple(r, t, translateLine(t)) } }.awaitAll()
+-        }.filter { it.second != it.third }
+-
+-        val items = out.map { (r, _, t) ->
+-            val box = RectF(r).apply { offset(0f, top.toFloat()); inset(-5f, -3f) }
+-            val bg = sampleBg(frame, box)
+-            val fg = if (Color.luminance(bg) > 0.5f) Color.BLACK else Color.WHITE
+-            val l = fit(t, box, fg, mode == 10)
+-            Item(box, Color.argb(235, Color.red(bg), Color.green(bg), Color.blue(bg)), l)
+-        }
+-        if (!live) return
+-        shown = items
+-        withContext(Dispatchers.Main) { overlay.show(items) }
+-        delay(200)
+-        synchronized(lock) { dirty = false }   // فریم‌های ناشی از خود لایه را نادیده بگیر
++                if (live && isActive) {
++                    shown = items
++                    withContext(Dispatchers.Main) { overlay.show(items) }
++                    if (items.isEmpty()) withContext(Dispatchers.Main) {
++                        Toast.makeText(this@TranslateService, "در این محدوده متن فینگلیش پیدا نشد", Toast.LENGTH_SHORT).show()
++                    }
++                }
++            } finally { crop.recycle() }
++        } catch (e: CancellationException) { throw e }
++        catch (_: Exception) {
++            if (live) withContext(Dispatchers.Main) {
++                Toast.makeText(this@TranslateService, "خواندن متن این قسمت ناموفق بود؛ دوباره بزن", Toast.LENGTH_SHORT).show()
++            }
++        } finally {
++            withContext(NonCancellable + Dispatchers.Main) {
++                if (::bubble.isInitialized) bubble.visibility = View.VISIBLE
++                if (!live) overlay.show(emptyList())
++            }
++        }
+     }
+ 
+     private fun px(b: Bitmap, x: Float, y: Float) =
+@@ -974,6 +974,7 @@
+         if (::reader.isInitialized) reader.close()
+         frameThread.quitSafely()
+         if (::proj.isInitialized) proj.stop()
++        scanJob?.cancel()
+         translator?.close()
+         if (::recognizer.isInitialized) recognizer.close()
+         super.onDestroy()
