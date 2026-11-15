@@ -21,8 +21,8 @@ jobs:
         run: |
           base64 -d app/src/main/java/com/example/bubbletranslate/MainActivity.kt.xz.b64 | xz -d -c > app/src/main/java/com/example/bubbletranslate/MainActivity.kt
           git apply -p0 bubble-fix.patch
-          git apply -p0 bubble-fix-compile.patch
           sed -i 's/if (captureMic && checkSelfPermission/if ((captureMic || captureInternal) \&\& checkSelfPermission/' app/src/main/java/com/example/bubbletranslate/MainActivity.kt
+          sed -i 's/isActive/currentCoroutineContext().isActive/g' app/src/main/java/com/example/bubbletranslate/MainActivity.kt
       - name: Upload restored source for inspection
         uses: actions/upload-artifact@v4
         with:
