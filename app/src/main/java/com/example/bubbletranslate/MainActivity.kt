@@ -998,3 +998,230 @@ class TranslateService : Service() {
     }
 
     // ترجمه‌ی دوباره‌ی صفحه‌ی فعلی (فقط وقتی خودت از منوی حباب بزنی؛ مثلاً بعد از اسکرول)
+    private fun rescan() {
+        if (!live) { toggle(); return }
+        val id = ++scanId
+        scanJob?.cancel()
+        shown = emptyList()
+        bubble.busy = true
+        bubble.invalidate()
+        scanJob = scope.launch { translateOnce(id) }
+    }
+
+    private suspend fun toast(msg: String) = withContext(Dispatchers.Main) {
+        Toast.makeText(this@TranslateService, msg, Toast.LENGTH_SHORT).show()
+    }
+
+    // یک بار: تصویر تمیز صفحه → OCR → ترجمه‌ی تک‌تک متن‌ها → کشیدن دقیقاً روی متن اصلی
+    private suspend fun translateOnce(id: Int) {
+        val sw = W
+        val sh = H
+        val d = resources.displayMetrics.density
+        var left = 0
+        var top = 0
+        var rw = sw
+        var rh = sh
+        if (mode == 12) {                       // زیرنویس: فقط بخش پایین صفحه
+            top = (sh * 0.58f).toInt()
+            rh = (sh - top).coerceAtLeast(1)
+        } else if (!whole) {                    // فقط اطراف حباب
+            val bp = bubbleParams ?: return
+            val cx = bp.x + bubbleSize / 2
+            val cy = bp.y + bubbleSize / 2
+            rw = minOf(sw, (560 * d).toInt()).coerceAtLeast(1)
+            rh = minOf(sh, (260 * d).toInt()).coerceAtLeast(1)
+            left = (cx - rw / 2).coerceIn(0, (sw - rw).coerceAtLeast(0))
+            top = (cy - rh / 2).coerceIn(0, (sh - rh).coerceAtLeast(0))
+        }
+        modelErr = false
+
+        try {
+            // حباب و ترجمه‌ی قبلی موقتاً پنهان می‌شوند تا OCR تصویر تمیز بگیرد.
+            withContext(Dispatchers.Main) {
+                overlay.show(emptyList())
+                bubble.visibility = View.INVISIBLE
+            }
+            delay(200)      // تا تغییر پنهان‌شدن حباب داخل فریم بعدی بیاید
+            var frame: Bitmap? = null
+            var waited = 0
+            while (live && frame == null && waited < 1800) {
+                frame = snapshot(true)
+                if (frame == null) { delay(40); waited += 40 }
+            }
+            if (!live) return
+            val full = frame
+            if (full == null) { toast("تصویر صفحه گرفته نشد؛ دوباره بزن"); return }
+            if (full.width != sw || full.height != sh) { toast("صفحه چرخید؛ دوباره بزن"); return }
+            withContext(Dispatchers.Main) { bubble.visibility = View.VISIBLE }   // تصویر در دست است؛ حباب برمی‌گردد
+
+            val crop = Bitmap.createBitmap(full, left, top, rw, rh)
+            val result = try {
+                recognizer.process(InputImage.fromBitmap(crop, 0)).await()
+            } finally {
+                if (crop !== full) crop.recycle()
+            }
+            if (!live) return
+            val segs = buildSegs(result, left, top)
+            if (segs.isEmpty()) { toast("متنی در این محدوده پیدا نشد"); return }
+            ensureModels()
+
+            val items = ArrayList<Item>()
+            for (s in segs) {
+                if (!live) return
+                if (!worth(s.text)) continue
+                val tr = convert(s.text) ?: continue
+                if (tr == s.text) continue
+                val box = RectF(s.box).apply { inset(-5f, -3f) }
+                val bg = sampleBg(full, box)
+                val fg = if (Color.luminance(bg) > 0.5f) Color.BLACK else Color.WHITE
+                items.add(Item(box, Color.argb(235, Color.red(bg), Color.green(bg), Color.blue(bg)), fit(tr, box, fg, s.lines)))
+                if (items.size % 6 == 0) {      // نمایش تدریجی تا منتظر آخر نمانی
+                    val part = items.toList()
+                    shown = part
+                    withContext(Dispatchers.Main) { overlay.show(part) }
+                }
+            }
+            if (!live) return
+            val fin = items.toList()
+            shown = fin
+            withContext(Dispatchers.Main) { overlay.show(fin) }
+            if (fin.isEmpty()) toast(if (modelErr) "مدل ترجمه روی گوشی نیست؛ در برنامه دکمه ۱ را (با اینترنت) بزن" else "متنی برای ترجمه پیدا نشد")
+            else if (modelErr) toast("بعضی متن‌ها ترجمه نشدند؛ در برنامه دکمه ۱ را (با اینترنت) بزن")
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            if (live) toast("خواندن یا ترجمه‌ی متن ناموفق بود؛ دوباره بزن")
+        } finally {
+            withContext(NonCancellable + Dispatchers.Main) {
+                if (::bubble.isInitialized) {
+                    bubble.visibility = View.VISIBLE
+                    if (id == scanId) {          // هنوز همین ترجمه فعال است (کاربر خاموش/دوباره‌ترجمه نکرده)
+                        bubble.busy = false
+                        if (live && shown.isEmpty()) { live = false; bubble.on = false }   // چیزی ترجمه نشد → حباب خاموش برمی‌گردد
+                        bubble.invalidate()
+                    }
+                }
+                if (!live) overlay.show(emptyList())
+            }
+        }
+    }
+
+    // خروجی OCR → تکه‌های قابل ترجمه بر اساس حالت (خط‌به‌خط / بلوک / زیرنویس)
+    private fun buildSegs(res: com.google.mlkit.vision.text.Text, dx: Int, dy: Int): List<Seg> {
+        fun mv(r: Rect) = RectF(r).apply { offset(dx.toFloat(), dy.toFloat()) }
+        val lines = res.textBlocks.flatMap { it.lines }
+        return when (mode) {
+            11 -> res.textBlocks.mapNotNull { b ->
+                b.boundingBox?.let { Seg(mv(it), b.lines.joinToString(" ") { l -> l.text }, b.lines.size.coerceAtLeast(1)) }
+            }
+            12 -> {
+                val ok = lines.filter { it.boundingBox != null }.sortedBy { it.boundingBox!!.top }
+                if (ok.isEmpty()) emptyList<Seg>() else {
+                    val u = mv(ok[0].boundingBox!!)
+                    for (l in ok) u.union(mv(l.boundingBox!!))
+                    listOf(Seg(u, ok.joinToString(" ") { it.text }, ok.size))
+                }
+            }
+            else -> lines.mapNotNull { l -> l.boundingBox?.let { Seg(mv(it), l.text, 1) } }
+        }
+    }
+
+    // فقط متن‌هایی که حرف دارند (نه آیکون و نویز)
+    private fun worth(t: String): Boolean {
+        var letters = 0
+        for (ch in t) if (ch.isLetter()) { letters++; if (ch.code > 0x0900) return true }
+        return letters >= 2
+    }
+
+    // مدل‌های ترجمه یک بار آماده می‌شوند (اگر قبلاً دانلود شده باشند فوری است و اینترنت لازم نیست)
+    private suspend fun ensureModels(): Boolean {
+        if (modelsOk) return true
+        val c = DownloadConditions.Builder().build()
+        val ok = try {
+            withTimeoutOrNull(25_000L) {
+                translator?.downloadModelIfNeeded(c)?.await()
+                trFa?.downloadModelIfNeeded(c)?.await()
+                true
+            } ?: false
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { false }
+        modelsOk = ok
+        return ok
+    }
+
+    // ترجمه‌ی یک متن:
+    //  • فینگلیش → فارسی با قاعده (و اگر مقصد فارسی نیست، فارسی → مقصد)
+    //  • انگلیسی/زبان خارجی → مدل ML Kit؛ بعدش هر اسم یا کلمه‌ی لاتین باقی‌مانده با حروف فارسی نوشته می‌شود
+    private suspend fun convert(text: String): String? {
+        cache[text]?.let { return it }
+        val fgl = srcRaw == Langs.FGL || (srcRaw == Langs.AUTO && Finglish.isFinglish(text))
+        val out: String = try {
+            if (fgl) {
+                val fa = Finglish.toPersian(text, all)
+                if (dstFa) fa else (trFa?.translate(fa)?.await() ?: fa)
+            } else {
+                val t = translator
+                if (t != null && !modelsOk) { modelErr = true; return null }
+                val r = if (t != null) t.translate(text).await() else text
+                if (dstFa && all) Finglish.toPersian(r, true, true) else r
+            }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { modelErr = true; return null }
+        if (cache.size > 4000) cache.clear()
+        cache[text] = out
+        return out
+    }
+
+    private fun px(b: Bitmap, x: Float, y: Float) =
+        b.getPixel(x.toInt().coerceIn(0, b.width - 1), y.toInt().coerceIn(0, b.height - 1))
+
+    // رنگ پس‌زمینه = میانه نمونه‌های اطراف کادر متن (در برابر نویز صحنه مقاوم است)
+    private fun sampleBg(b: Bitmap, r: RectF): Int {
+        val pts = ArrayList<Int>()
+        for (x in listOf(r.left - 4, r.right + 4)) for (y in listOf(r.top + 2, r.centerY(), r.bottom - 2)) pts.add(px(b, x, y))
+        for (x in listOf(r.left + 2, r.centerX(), r.right - 2)) for (y in listOf(r.top - 4, r.bottom + 4)) pts.add(px(b, x, y))
+        fun med(f: (Int) -> Int) = pts.map(f).sorted()[pts.size / 2]
+        return Color.rgb(med { Color.red(it) }, med { Color.green(it) }, med { Color.blue(it) })
+    }
+
+    // بزرگ‌ترین فونتی که متن ترجمه را جا بدهد؛ n = تعداد خط‌های متن اصلی
+    // (یک‌خطی: اگر لازم باشد کادر به راست باز می‌شود؛ چندخطی: متن داخل کادر می‌شکند)
+    private fun fit(text: String, box: RectF, fg: Int, n: Int): StaticLayout {
+        val one = n <= 1
+        val p = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = fg }
+        val maxW = (W - box.left - 4f).coerceAtLeast(box.width())
+        var size = (box.height() / n.coerceAtLeast(1)).coerceAtMost(64f) * 0.8f
+        lateinit var l: StaticLayout
+        do {
+            p.textSize = size
+            val w = if (one) minOf(maxOf(Layout.getDesiredWidth(text, p), box.width()), maxW).toInt() + 1
+            else box.width().toInt().coerceAtLeast(40)
+            l = StaticLayout.Builder.obtain(text, 0, text.length, p, w)
+                .setTextDirection(TextDirectionHeuristics.FIRSTSTRONG_LTR).build()
+            size -= 1f
+            val ok = if (one) l.lineCount == 1 else l.height <= box.height()
+        } while (!ok && size > 9f)
+        box.right = maxOf(box.right, box.left + l.width)
+        return l
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        main.removeCallbacksAndMessages(null)
+        if (::wm.isInitialized) {
+            hideMenu()
+            runCatching { wm.removeView(overlay) }
+            runCatching { wm.removeView(bubble) }
+        }
+        rec?.let { r -> rec = null; Thread { r.stop() }.start() }
+        synchronized(lock) { pending?.close(); pending = null }
+        vd?.release()
+        if (::reader.isInitialized) reader.close()
+        frameThread.quitSafely()
+        if (::proj.isInitialized) proj.stop()
+        scanJob?.cancel()
+        translator?.close()
+        trFa?.close()
+        if (::recognizer.isInitialized) recognizer.close()
+        super.onDestroy()
+    }
+}
