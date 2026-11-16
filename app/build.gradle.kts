@@ -9,8 +9,8 @@ android {
         applicationId = "com.example.bubbletranslate"
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "4.0"
+        versionCode = 5
+        versionName = "4.1"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
